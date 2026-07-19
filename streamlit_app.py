@@ -1,5 +1,6 @@
 import streamlit as st
 import gspread
+import pandas as pd
 from google.oauth2 import service_account
 from datetime import datetime, date, timedelta
 from collections import defaultdict
@@ -7,7 +8,7 @@ import json
 
 st.set_page_config(page_title="我的學習小站", page_icon="📚")
 
-# --- 連接 Google Sheets（現在有 3 個分頁）---
+# --- 連接 Google Sheets（3 個分頁）---
 @st.cache_resource
 def get_sheets():
     scopes = [
@@ -48,8 +49,8 @@ def get_correct(q, opts):
         return opts[int(raw) - 1]
     return None
 
-# --- 萊特納：從作答紀錄算出每題的複習狀態 ---
-INTERVALS = {1: 1, 2: 3, 3: 7, 4: 14, 5: 30}  # 盒子 -> 幾天後再複習
+# --- 萊特納：從作答紀錄算出每題狀態 ---
+INTERVALS = {1: 1, 2: 3, 3: 7, 4: 14, 5: 30}
 MAX_BOX = 5
 
 def compute_state(logs, all_qids):
@@ -70,7 +71,7 @@ def compute_state(logs, all_qids):
     state = {}
     for qid in all_qids:
         events = sorted(history.get(qid, []))
-        if not events:  # 從未作答 = 待練習的新題
+        if not events:
             state[qid] = {"box": 0, "due": True}
             continue
         box = 1
@@ -80,7 +81,7 @@ def compute_state(logs, all_qids):
         state[qid] = {"box": box, "due": next_date <= today}
     return state
 
-# --- 呈現一組題目、批改、寫紀錄、答錯帶重點 ---
+# --- 出題、批改、寫紀錄、答錯帶重點 ---
 def render_quiz(quiz, form_key):
     with st.form(form_key):
         answers = {}
@@ -133,6 +134,82 @@ def render_quiz(quiz, form_key):
             if pts:
                 st.info("📌 這個單元的重點：\n\n" + "\n".join(f"- {p}" for p in pts))
 
+# --- 家長儀表板 ---
+def render_dashboard():
+    st.header("👨‍👩‍👧 家長儀表板")
+    if not logs:
+        st.info("還沒有任何作答紀錄。")
+        return
+
+    qinfo = {}
+    for q in questions:
+        qid = str(q.get("題號", "")).strip()
+        if qid:
+            qinfo[qid] = {
+                "科目": str(q.get("科目", "")).strip(),
+                "單元": str(q.get("單元", "")).strip(),
+                "題目": str(q.get("題目", "")).strip(),
+            }
+
+    rows = []
+    for r in logs:
+        qid = str(r.get("題號", "")).strip()
+        res = str(r.get("對錯", "")).strip()
+        if qid in qinfo and res in ("O", "X"):
+            rows.append({
+                "題號": qid, "科目": qinfo[qid]["科目"], "單元": qinfo[qid]["單元"],
+                "題目": qinfo[qid]["題目"], "對錯": res, "correct": 1 if res == "O" else 0,
+            })
+    if not rows:
+        st.info("紀錄裡還沒有能對應到題庫的作答。")
+        return
+
+    df = pd.DataFrame(rows)
+
+    # 總覽
+    c1, c2, c3 = st.columns(3)
+    c1.metric("總作答次數", len(df))
+    c2.metric("整體正確率", f"{df['correct'].mean()*100:.0f}%")
+    c3.metric("練習過的題數", df["題號"].nunique())
+
+    # 各科正確率
+    st.subheader("各科正確率")
+    subj = df.groupby("科目")["correct"].agg(題數="count", 正確率="mean")
+    subj["正確率"] = (subj["正確率"] * 100).round(0).astype(int)
+    st.bar_chart(subj["正確率"])
+    st.dataframe(subj)
+
+    # 最弱單元
+    st.subheader("最弱單元（優先加強）")
+    unit = (
+        df.groupby(["科目", "單元"])["correct"]
+        .agg(題數="count", 正確率="mean")
+        .reset_index()
+    )
+    unit = unit[unit["題數"] >= 3].copy()
+    if len(unit):
+        unit["正確率"] = (unit["正確率"] * 100).round(0).astype(int)
+        unit = unit.sort_values("正確率")
+        st.dataframe(unit, hide_index=True)
+    else:
+        st.caption("每個單元累積作答滿 3 次後才會列入，多練幾題就會出現。")
+
+    # 反覆答錯的題目
+    st.subheader("反覆答錯、還沒攻克的題目")
+    state = compute_state(logs, list(qinfo.keys()))
+    wrong = (
+        df[df["對錯"] == "X"]
+        .groupby(["題號", "科目", "單元", "題目"])
+        .size().reset_index(name="答錯次數")
+    )
+    wrong["目前盒子"] = wrong["題號"].map(lambda x: state.get(x, {}).get("box", 0))
+    stuck = wrong[wrong["目前盒子"] == 1].sort_values("答錯次數", ascending=False)
+    if len(stuck):
+        st.dataframe(stuck[["題號", "科目", "單元", "題目", "答錯次數"]], hide_index=True)
+        st.caption("這些題最近一次仍答錯，建議陪孩子一起看。")
+    else:
+        st.success("目前沒有反覆卡關的題目 🎉")
+
 # ============ 介面 ============
 st.title("📚 我的學習小站")
 
@@ -140,7 +217,7 @@ if not questions:
     st.warning("題庫還沒有題目，先到 Google 試算表的「題庫」分頁加幾題吧！")
     st.stop()
 
-mode = st.sidebar.radio("模式", ["📝 練習模式", "🔁 複習模式"])
+mode = st.sidebar.radio("模式", ["📝 練習模式", "🔁 複習模式", "👨‍👩‍👧 家長儀表板"])
 
 if mode == "📝 練習模式":
     subjects = sorted({str(q["科目"]) for q in questions if str(q.get("科目", "")).strip()})
@@ -149,15 +226,15 @@ if mode == "📝 練習模式":
     st.caption(f"本次共 {len(quiz)} 題")
     render_quiz(quiz, "practice_form")
 
-else:  # 複習模式
+elif mode == "🔁 複習模式":
     all_qids = [str(q.get("題號", "")).strip() for q in questions]
     state = compute_state(logs, all_qids)
 
     def priority(qid):
         s = state[qid]
-        if s["box"] == 0:      # 新題排在複習題之後
+        if s["box"] == 0:
             return (2, 0)
-        return (1, s["box"])   # 已作答且到期：盒子小的（最近答錯）優先
+        return (1, s["box"])
 
     due_qids = sorted([qid for qid in all_qids if state[qid]["due"]], key=priority)
     wrong_cnt = sum(1 for qid in due_qids if state[qid]["box"] == 1)
@@ -173,3 +250,15 @@ else:  # 複習模式
     if len(due_qids) > LIMIT:
         st.caption(f"（先做前 {LIMIT} 題，其餘下次再複習）")
     render_quiz(quiz, "review_form")
+
+else:  # 家長儀表板（需要密碼）
+    if not st.session_state.get("parent_ok"):
+        pw = st.text_input("請輸入家長密碼", type="password")
+        if pw and pw == st.secrets.get("parent_password", ""):
+            st.session_state["parent_ok"] = True
+        elif pw:
+            st.error("密碼錯誤")
+    if st.session_state.get("parent_ok"):
+        render_dashboard()
+    else:
+        st.stop()
